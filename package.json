@@ -1,0 +1,10 @@
+{
+  "name": "predator-c2",
+  "version": "1.0.0",
+  "description": "Project Predator Command Center",
+  "main": "server.js",
+  "dependencies": {
+    "crypto": "^1.0.1",
+    "socket.io": "^4.8.3"
+  }
+}
